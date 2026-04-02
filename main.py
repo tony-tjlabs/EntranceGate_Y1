@@ -74,6 +74,24 @@ def render_metric_card(label: str, value: str, sub: str = ""):
     )
 
 
+# ── 인증 ──────────────────────────────────────────────────────────────────
+
+PASSWORD = "wonderful2$"
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.markdown("### Y1 출입구 트래픽 분석")
+    pw = st.text_input("비밀번호", type="password", key="pw_input")
+    if pw:
+        if pw == PASSWORD:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 틀렸습니다.")
+    st.stop()
+
 # ── 사이드바 ────────────────────────────────────────────────────────────────
 
 with st.sidebar:
