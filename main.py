@@ -15,7 +15,7 @@ import pandas as pd
 from src.data_loader import (
     is_cache_valid,
     load_daily_summary, load_hourly_summary, load_gateway_summary,
-    load_gateway_daily, load_fine_summary, load_dwell_times, load_meta,
+    load_gateway_daily, load_fine_summary, load_gate_flow, load_meta,
 )
 from src.metrics import (
     compute_overview_metrics, compute_peak_analysis, compute_weekly_trend,
@@ -23,6 +23,7 @@ from src.metrics import (
     estimate_exit_headcount, compute_daily_exit_headcount,
     compute_entry_headcount, compute_daily_commute_times,
     detect_gate_openings, estimate_wait_time_distribution,
+    compute_all_gate_events, analyze_entry_flow, compute_all_entry_flows,
     SPECIAL_DAYS,
 )
 from src.charts import (
@@ -32,10 +33,9 @@ from src.charts import (
     create_exit_flow_chart, create_daily_headcount_chart,
     create_headcount_comparison_chart, create_entry_exit_comparison,
     create_multidate_comparison_chart, create_period_avg_chart,
-    create_dwell_histogram, create_daily_dwell_chart,
     create_intraday_fine_with_range,
-    create_single_date_dwell_chart,
-    create_wait_time_chart, create_gate_flow_chart,
+    create_wait_time_chart, create_gate_flow_chart, create_entry_flow_chart,
+    create_gate_events_trend, create_gate_events_by_dow, create_gate_events_scatter,
 )
 from src.llm_analyzer import is_llm_ready, analyze_daily_pattern, compare_dates_pattern
 
@@ -115,7 +115,6 @@ with st.sidebar:
     if meta:
         st.success(f"데이터 로드됨 ({meta['days']}일)")
         st.caption(f"기간: {meta['date_range'][0]} ~ {meta['date_range'][1]}")
-
     st.divider()
 
 # ── 데이터 로드 ─────────────────────────────────────────────────────────────
@@ -129,7 +128,8 @@ hourly_df = load_hourly_summary(CACHE_DIR)
 gw_hourly_df = load_gateway_summary(CACHE_DIR)
 gw_daily_df = load_gateway_daily(CACHE_DIR)
 fine_df = load_fine_summary(CACHE_DIR)
-dwell_df = load_dwell_times(CACHE_DIR)
+gate_flow_df = load_gate_flow(CACHE_DIR)
+
 daily_df = add_day_metadata(daily_df)
 
 # ── 사이드바 필터 + 설정 ──────────────────────────────────────────────────
@@ -154,17 +154,12 @@ with st.sidebar:
         step=1, format="%02d:00", key="entry_range",
     )
     exit_range = st.slider(
-        "퇴근 시간대", min_value=12, max_value=24, value=(17, 19),
+        "퇴근 시간대", min_value=12, max_value=24, value=(16, 20),
         step=1, format="%02d:00", key="exit_range",
     )
 
     st.divider()
-    st.markdown("**RSSI 필터** (캐시에 적용됨)")
-    st.caption("iOS: ≥ -70 dBm / Android: ≥ -80 dBm")
-
-    st.divider()
-    iphone_only_dwell = st.toggle("체류시간: iPhone만", value=True, key="iphone_dwell")
-    st.caption("iPhone MAC 15-20분 유지 → 더 정확")
+    st.caption("**게이트 오픈**: 17:30, 19:30")
 
     st.divider()
     llm_ready = is_llm_ready()
@@ -181,14 +176,7 @@ hourly_f = hourly_df[(hourly_df["date"] >= ds) & (hourly_df["date"] <= de)].copy
 gw_hourly_f = gw_hourly_df[(gw_hourly_df["date"] >= ds) & (gw_hourly_df["date"] <= de)].copy()
 gw_daily_f = gw_daily_df[(gw_daily_df["date"] >= ds) & (gw_daily_df["date"] <= de)].copy()
 fine_f = fine_df[(fine_df["date"] >= ds) & (fine_df["date"] <= de)].copy()
-
-# 체류시간: 사이드바 설정 반영
-if not dwell_df.empty:
-    dwell_f = dwell_df[(dwell_df["date"] >= ds) & (dwell_df["date"] <= de)].copy()
-    if iphone_only_dwell:
-        dwell_f = dwell_f[dwell_f["device_type"] == 1]
-else:
-    dwell_f = pd.DataFrame()
+gf_f = gate_flow_df[(gate_flow_df["date"] >= ds) & (gate_flow_df["date"] <= de)].copy() if not gate_flow_df.empty else pd.DataFrame()
 
 if daily_f.empty:
     st.warning("선택한 기간에 데이터가 없습니다.")
@@ -242,115 +230,121 @@ with tab1:
         display_cols = day_summary[[
             "date", "day_name_kr", "day_type",
             "entry_start", "entry_peak", "exit_peak", "exit_end",
-            "est_headcount", "peak_entry_dc", "peak_exit_dc", "active_hours"
+            "est_headcount", "active_hours"
         ]].copy()
         display_cols.columns = [
             "날짜", "요일", "구분", "출근 시작", "출근 피크", "퇴근 피크", "퇴근 종료",
-            "추정 인원", "출근 피크 DC", "퇴근 피크 DC", "활성(시간)"
+            "추정 인원", "활성(시간)"
         ]
-
-        # 체류시간 추가
-        if not dwell_f.empty:
-            entry_dwell_daily = dwell_f[dwell_f["period"] == "entry"].groupby("date")["dwell_sec"].median().reset_index()
-            entry_dwell_daily["dwell_min"] = (entry_dwell_daily["dwell_sec"] / 60).round(1)
-            exit_dwell_daily = dwell_f[dwell_f["period"] == "exit"].groupby("date")["dwell_sec"].median().reset_index()
-            exit_dwell_daily["dwell_min"] = (exit_dwell_daily["dwell_sec"] / 60).round(1)
-
-            display_cols = display_cols.merge(
-                entry_dwell_daily[["date", "dwell_min"]].rename(columns={"date": "날짜", "dwell_min": "출근 체류(분)"}),
-                on="날짜", how="left"
-            ).merge(
-                exit_dwell_daily[["date", "dwell_min"]].rename(columns={"date": "날짜", "dwell_min": "퇴근 체류(분)"}),
-                on="날짜", how="left"
-            )
-
         st.dataframe(display_cols, use_container_width=True, hide_index=True)
 
-        # 날짜별 5분 단위 트래픽 + 시간 슬라이더
-        st.markdown('<div class="section-header">날짜별 5분 단위 트래픽</div>', unsafe_allow_html=True)
+        # ── 날짜 선택 → 출근/퇴근 상세 분석 ──
+        st.markdown("")
         avail_dates = sorted(day_summary["date"].unique())
         sel_date = st.selectbox("날짜 선택", avail_dates, index=len(avail_dates) - 1, key="day_select")
+
         if sel_date:
-            hour_range = st.slider(
-                "시간 범위", min_value=0, max_value=24, value=(0, 24),
-                step=1, format="%02d:00", key="hour_slider",
-            )
+            # 전체 하루 개요
             st.plotly_chart(
-                create_intraday_fine_with_range(fine_f, sel_date, hour_range[0], hour_range[1]),
+                create_intraday_fine_with_range(fine_f, sel_date, 0, 24),
                 use_container_width=True,
             )
 
-            # 해당 날짜 체류시간
-            if not dwell_f.empty:
-                day_dwell = dwell_f[dwell_f["date"] == sel_date]
-                if not day_dwell.empty:
-                    entry_d = day_dwell[day_dwell["period"] == "entry"]
-                    exit_d = day_dwell[day_dwell["period"] == "exit"]
-                    c1, c2, c3 = st.columns(3)
+            # 출근 / 퇴근 서브탭
+            sub_entry, sub_exit = st.tabs(["출근 분석", "퇴근 분석"])
+
+            # ── 출근 분석 ──
+            with sub_entry:
+                entry_info = analyze_entry_flow(fine_f, gf_f, sel_date)
+                if entry_info:
+                    c1, c2, c3, c4, c5 = st.columns(5)
                     with c1:
-                        v = entry_d["dwell_sec"].median() / 60 if not entry_d.empty else 0
-                        n = len(entry_d)
-                        render_metric_card("출근 체류", f"{v:.1f}분", f"중앙값 (n={n:,})")
+                        render_metric_card("피크 혼잡도",
+                                          f"{entry_info['peak_crowd']:,}명",
+                                          f"피크 {entry_info['peak_time']}")
                     with c2:
-                        v = exit_d["dwell_sec"].median() / 60 if not exit_d.empty else 0
-                        n = len(exit_d)
-                        render_metric_card("퇴근 체류", f"{v:.1f}분", f"중앙값 (n={n:,})")
+                        render_metric_card("러시",
+                                          f"{entry_info['rush_start']}~{entry_info['rush_end']}",
+                                          f"{entry_info['rush_duration']}분간")
                     with c3:
-                        pct = (exit_d["dwell_sec"] > 300).mean() * 100 if not exit_d.empty else 0
-                        render_metric_card("5분+ 대기", f"{pct:.0f}%", "퇴근 시간대")
-                    st.plotly_chart(create_single_date_dwell_chart(dwell_f, sel_date),
-                                   use_container_width=True, key="day_dwell_hist")
+                        render_metric_card("평균 통과",
+                                          f"{entry_info['avg_throughput']}명/분",
+                                          "게이트 처리량")
+                    with c4:
+                        render_metric_card("피크 통과",
+                                          f"{entry_info['peak_throughput']}명/분",
+                                          "최대 처리량")
+                    with c5:
+                        render_metric_card("평균 유입",
+                                          f"{entry_info['avg_inflow']}명/분",
+                                          "신규 MAC 기반")
 
-            # 퇴근 대기 시간 분석 (트래픽 기반)
-            st.markdown('<div class="section-header">퇴근 대기 시간 분석</div>', unsafe_allow_html=True)
-            st.markdown(
-                '<div class="info-box">'
-                '게이트 오픈 시점을 DC 급락으로 자동 탐지하고, 모임 시작~오픈까지 '
-                '도착 인원별 대기 시간을 추정합니다. (MAC 추적 불필요)'
-                '</div>',
-                unsafe_allow_html=True,
-            )
+                    entry_fig = create_entry_flow_chart(fine_f, sel_date, entry_info)
+                    if entry_fig:
+                        st.plotly_chart(entry_fig, use_container_width=True, key="entry_flow")
 
-            events = detect_gate_openings(fine_f, sel_date)
-            if events:
-                # 퇴근 흐름 차트 (모임→오픈 표시)
-                gate_fig = create_gate_flow_chart(fine_f, sel_date, events)
-                if gate_fig:
-                    st.plotly_chart(gate_fig, use_container_width=True, key="gate_flow")
+                    st.markdown(
+                        '<div class="info-box">'
+                        '<b>출근 특성</b> — 게이트가 항상 열려 있어 도착하는 대로 바로 통과합니다. '
+                        '대기 시간 없이 연속적으로 유입되며, 개인별 출근 시각에 따라 분산됩니다.'
+                        '</div>', unsafe_allow_html=True,
+                    )
+                else:
+                    st.caption("해당 날짜에 출근 데이터가 없습니다.")
 
-                # 대기 시간 분포
-                wait_results = estimate_wait_time_distribution(fine_f, sel_date)
-                if wait_results:
-                    # 이벤트별 메트릭 카드
-                    for idx, wr in enumerate(wait_results):
-                        evt = wr["event"]
-                        stats = wr["stats"]
-                        cols = st.columns(6)
-                        with cols[0]:
-                            render_metric_card(
-                                f"{idx+1}차 게이트 오픈", evt["gate_open_time"],
-                                f"피크 DC {evt['peak_dc']:,}")
-                        with cols[1]:
-                            render_metric_card("모임 시작", evt["gathering_start_time"],
-                                              f"피크까지 DC 축적")
-                        with cols[2]:
-                            render_metric_card("대기 중앙값", f"{stats['median']}분",
-                                              f"전체 {stats['total_people']:,}명")
-                        with cols[3]:
-                            render_metric_card("P75", f"{stats['p75']}분",
-                                              "75% 이하 대기")
-                        with cols[4]:
-                            render_metric_card("P90", f"{stats['p90']}분",
-                                              "90% 이하 대기")
-                        with cols[5]:
-                            render_metric_card("최대 대기", f"{stats['max']}분",
-                                              "가장 오래 기다린 그룹")
+            # ── 퇴근 분석 ──
+            with sub_exit:
+                events = detect_gate_openings(fine_f, sel_date, gf_f)
+                if events:
+                    gate_fig = create_gate_flow_chart(fine_f, sel_date, events)
+                    if gate_fig:
+                        st.plotly_chart(gate_fig, use_container_width=True, key="gate_flow")
 
-                    wait_fig = create_wait_time_chart(wait_results)
-                    if wait_fig:
-                        st.plotly_chart(wait_fig, use_container_width=True, key="wait_dist")
-            else:
-                st.caption("해당 날짜에 게이트 오픈 이벤트가 탐지되지 않았습니다 (주말/공휴일 등).")
+                    wait_results = estimate_wait_time_distribution(fine_f, sel_date, gf_f)
+                    if wait_results:
+                        bl = wait_results[0]["event"].get("baseline_dc", 0)
+                        if bl > 0:
+                            st.caption(f"배경 트래픽 DC ~{bl} (14~16시 기준) 차감 후 분석")
+
+                        for idx, wr in enumerate(wait_results):
+                            evt = wr["event"]
+                            stats = wr["stats"]
+                            drain_min = evt.get("drain_minutes", 0)
+                            cols = st.columns(6)
+                            with cols[0]:
+                                render_metric_card(
+                                    f"{idx+1}차 퇴근 ({evt['gate_open_time']})",
+                                    f"대기 {evt['peak_dc']:,}명",
+                                    f"모임 {evt['gathering_start_time']} ~")
+                            with cols[1]:
+                                render_metric_card("통과 소요", f"{drain_min}분",
+                                                  f"완료 {evt.get('clear_time', '')}")
+                            with cols[2]:
+                                gf_avg = evt.get("gf_avg_outflow", 0)
+                                gf_peak = evt.get("gf_peak_outflow", 0)
+                                render_metric_card("유출 속도", f"{gf_avg}명/분",
+                                                  f"피크 {gf_peak}명/분")
+                            with cols[3]:
+                                render_metric_card("대기 중앙값", f"{stats['median']}분",
+                                                  f"{stats['total_people']:,}명")
+                            with cols[4]:
+                                render_metric_card("대기 P90", f"{stats['p90']}분",
+                                                  "90%가 이 이내")
+                            with cols[5]:
+                                render_metric_card("최대 대기", f"{stats['max']}분", "")
+
+                        wait_fig = create_wait_time_chart(wait_results)
+                        if wait_fig:
+                            st.plotly_chart(wait_fig, use_container_width=True, key="wait_dist")
+
+                    st.markdown(
+                        '<div class="info-box">'
+                        '<b>퇴근 특성</b> — 게이트가 정해진 시간(17:30, 19:30)에 열립니다. '
+                        '근로자들은 오픈 전에 모여서 대기하며, 오픈 후 일제히 빠져나갑니다.'
+                        '</div>', unsafe_allow_html=True,
+                    )
+                else:
+                    st.caption("해당 날짜에 퇴근 이벤트가 없습니다 (공휴일 등).")
 
     else:
         st.warning("데이터가 부족합니다.")
@@ -369,28 +363,48 @@ with tab2:
 
     if compare_dates:
         st.plotly_chart(create_multidate_comparison_chart(fine_f, compare_dates), use_container_width=True)
-
-        # 선택 기간 체류시간 비교
-        if not dwell_f.empty:
-            with st.expander("체류 시간 비교", expanded=False):
-                dwell_sel = dwell_f[dwell_f["date"].isin(compare_dates)]
-                if not dwell_sel.empty:
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        entry_d = dwell_sel[dwell_sel["period"] == "entry"]
-                        v = entry_d["dwell_sec"].median() / 60 if not entry_d.empty else 0
-                        render_metric_card("출근 체류 중앙값", f"{v:.1f}분",
-                                          f"iPhone{'만' if iphone_only_dwell else '+Android'}")
-                    with c2:
-                        exit_d = dwell_sel[dwell_sel["period"] == "exit"]
-                        v = exit_d["dwell_sec"].median() / 60 if not exit_d.empty else 0
-                        render_metric_card("퇴근 체류 중앙값", f"{v:.1f}분",
-                                          f"iPhone{'만' if iphone_only_dwell else '+Android'}")
-                    st.plotly_chart(create_dwell_histogram(dwell_sel), use_container_width=True)
-
         st.plotly_chart(create_period_avg_chart(fine_f, compare_dates), use_container_width=True)
+
+    # 대기 시간 · 통과 시간 전체 기간 분석
+    st.markdown('<div class="section-header">퇴근 대기 · 통과 시간 분석</div>', unsafe_allow_html=True)
+
+    gate_events = compute_all_gate_events(fine_f, gf_f)
+    if not gate_events.empty:
+        # 전체 요약 메트릭
+        e1 = gate_events[gate_events["gate_open"].str.startswith("17")]
+        e2 = gate_events[gate_events["gate_open"].str.startswith("19")]
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            v = e1["wait_p90"].median() if not e1.empty else 0
+            render_metric_card("1차 대기 P90", f"{v:.0f}분", f"~17:30 오픈 ({len(e1)}회)")
+        with c2:
+            v = e1["drain_minutes"].median() if not e1.empty else 0
+            render_metric_card("1차 통과 소요", f"{v:.0f}분", "오픈→완료")
+        with c3:
+            v = e2["wait_p90"].median() if not e2.empty else 0
+            render_metric_card("2차 대기 P90", f"{v:.0f}분", f"~19:30 오픈 ({len(e2)}회)")
+        with c4:
+            v = e2["drain_minutes"].median() if not e2.empty else 0
+            render_metric_card("2차 통과 소요", f"{v:.0f}분", "오픈→완료")
+
+        st.plotly_chart(create_gate_events_trend(gate_events), use_container_width=True, key="gate_trend")
+        st.plotly_chart(create_gate_events_by_dow(gate_events), use_container_width=True, key="gate_dow")
+        st.plotly_chart(create_gate_events_scatter(gate_events), use_container_width=True, key="gate_scatter")
+
+        with st.expander("전체 게이트 이벤트 테이블"):
+            display_events = gate_events[[
+                "date", "day_name_kr", "day_type", "gate_open",
+                "gathering_start", "peak_dc", "drain_minutes",
+                "wait_median", "wait_p90", "wait_max", "total_people"
+            ]].copy()
+            display_events.columns = [
+                "날짜", "요일", "구분", "오픈 시각", "모임 시작",
+                "피크 DC", "통과(분)", "대기 중앙값", "대기 P90", "대기 최대", "추정 인원"
+            ]
+            st.dataframe(display_events, use_container_width=True, hide_index=True)
     else:
-        st.info("비교할 날짜를 선택하세요.")
+        st.caption("게이트 이벤트가 없습니다.")
 
 # ── 탭3: AI Insight ───────────────────────────────────────────────────────
 

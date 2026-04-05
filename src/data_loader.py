@@ -8,7 +8,7 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-CACHE_VERSION = "5.1"
+CACHE_VERSION = "6.1"
 
 
 def is_cache_valid(cache_dir: str) -> bool:
@@ -48,8 +48,8 @@ def load_fine_summary(cache_dir: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False, ttl=None)
-def load_dwell_times(cache_dir: str) -> pd.DataFrame:
-    path = os.path.join(cache_dir, "dwell_times.parquet")
+def load_gate_flow(cache_dir: str) -> pd.DataFrame:
+    path = os.path.join(cache_dir, "gate_flow.parquet")
     if not os.path.exists(path):
         return pd.DataFrame()
     return pd.read_parquet(path)

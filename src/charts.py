@@ -842,7 +842,8 @@ def create_wait_time_chart(wait_results: list[dict]) -> go.Figure | None:
     fig = make_subplots(
         rows=n, cols=1,
         subplot_titles=[
-            f"{r['event']['gate_open_time']} 게이트 오픈 (피크 DC {r['event']['peak_dc']:,})"
+            f"{r['event']['gate_open_time']} 오픈 → {r['event'].get('clear_time', '')} 완료 "
+            f"(피크 DC {r['event']['peak_dc']:,}, 통과 {r['event'].get('drain_minutes', 0)}분)"
             for r in wait_results
         ],
         vertical_spacing=0.15 if n > 1 else 0.1,
@@ -878,9 +879,12 @@ def create_wait_time_chart(wait_results: list[dict]) -> go.Figure | None:
             f"최대 {stats['max']}분 | "
             f"총 {stats['total_people']:,}명"
         )
+        # xref for subplot: "x" for row 1, "x2" for row 2, etc.
+        xref_str = "x domain" if row == 1 else f"x{row} domain"
+        yref_str = "y domain" if row == 1 else f"y{row} domain"
         fig.add_annotation(
             text=ann,
-            xref=f"x{row} domain", yref=f"y{row} domain",
+            xref=xref_str, yref=yref_str,
             x=0.5, y=1.0,
             xanchor="center", yanchor="bottom",
             showarrow=False,
@@ -896,6 +900,60 @@ def create_wait_time_chart(wait_results: list[dict]) -> go.Figure | None:
         ),
         showlegend=False,
     )
+    return fig
+
+
+def create_entry_flow_chart(fine_df: pd.DataFrame, date: str, entry_info: dict) -> go.Figure | None:
+    """출근 흐름 차트 — 연속 유입 패턴 시각화."""
+    day = fine_df[fine_df["date"] == date].sort_values("time_bin")
+    morning = day[(day["time_bin"] >= 3 * 60) & (day["time_bin"] <= 10 * 60)]
+
+    if morning.empty:
+        return None
+
+    times = morning["time_bin"].apply(lambda x: f"{x // 60:02d}:{x % 60:02d}")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=times, y=morning["dc"],
+        mode="lines+markers",
+        name="DC (5분 단위)",
+        line=dict(color=COLORS["primary"], width=2.5),
+        fill="tozeroy", fillcolor="rgba(74,144,217,0.15)",
+    ))
+
+    # 러시 구간 하이라이트
+    rush_start = entry_info["rush_start"]
+    rush_end = entry_info["rush_end"]
+    fig.add_shape(
+        type="rect", x0=rush_start, x1=rush_end, y0=0, y1=1, yref="paper",
+        fillcolor="rgba(255,140,66,0.08)", line_width=0,
+    )
+    fig.add_annotation(
+        x=rush_start, y=1, yref="paper",
+        text=f"러시 {rush_start}~{rush_end}",
+        showarrow=False, yshift=10, xanchor="left",
+        font=dict(color="#FF8C42", size=10),
+    )
+
+    # 피크 마커
+    fig.add_shape(
+        type="line", x0=entry_info["peak_time"], x1=entry_info["peak_time"],
+        y0=0, y1=1, yref="paper",
+        line=dict(color="#FF8C42", width=2, dash="dash"),
+    )
+    fig.add_annotation(
+        x=entry_info["peak_time"], y=1, yref="paper",
+        text=f"피크 {entry_info['peak_time']} (DC {entry_info['peak_crowd']})",
+        showarrow=False, yshift=10,
+        font=dict(color="#FF8C42", size=11),
+    )
+
+    fig.update_layout(**_base_layout(
+        title=f"{date} 출근 흐름 — 연속 유입 (오는대로 바로 통과)",
+        xaxis_title="시간",
+        yaxis_title="DC (5분 unique MAC)",
+    ))
     return fig
 
 
@@ -919,19 +977,29 @@ def create_gate_flow_chart(fine_df: pd.DataFrame, date: str, events: list[dict])
     ))
 
     for evt in events:
-        fig.add_vline(
-            x=evt["gate_open_time"],
-            line_dash="dash", line_color="#E85D75", line_width=2,
-            annotation_text=f"게이트 오픈 {evt['gate_open_time']}",
-            annotation_position="top",
-            annotation_font_color="#E85D75",
+        # vline with annotation causes TypeError with categorical x-axis
+        # Use shape + annotation separately
+        fig.add_shape(
+            type="line", x0=evt["gate_open_time"], x1=evt["gate_open_time"],
+            y0=0, y1=1, yref="paper",
+            line=dict(color="#E85D75", width=2, dash="dash"),
         )
-        fig.add_vline(
-            x=evt["gathering_start_time"],
-            line_dash="dot", line_color="#F5A623", line_width=1.5,
-            annotation_text=f"모임 시작 {evt['gathering_start_time']}",
-            annotation_position="top left",
-            annotation_font_color="#F5A623",
+        fig.add_annotation(
+            x=evt["gate_open_time"], y=1, yref="paper",
+            text=f"오픈 {evt['gate_open_time']}",
+            showarrow=False, yshift=10,
+            font=dict(color="#E85D75", size=11),
+        )
+        fig.add_shape(
+            type="line", x0=evt["gathering_start_time"], x1=evt["gathering_start_time"],
+            y0=0, y1=1, yref="paper",
+            line=dict(color="#F5A623", width=1.5, dash="dot"),
+        )
+        fig.add_annotation(
+            x=evt["gathering_start_time"], y=0.95, yref="paper",
+            text=f"모임 {evt['gathering_start_time']}",
+            showarrow=False, yshift=10,
+            font=dict(color="#F5A623", size=10),
         )
 
     fig.update_layout(
@@ -941,4 +1009,132 @@ def create_gate_flow_chart(fine_df: pd.DataFrame, date: str, events: list[dict])
             yaxis_title="DC (5분 unique MAC)",
         )
     )
+    return fig
+
+
+def create_gate_events_trend(events_df: pd.DataFrame) -> go.Figure:
+    """일별 대기 시간 + 통과 시간 추이 (1차/2차 퇴근 분리)."""
+    if events_df.empty:
+        return go.Figure()
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=["대기 시간 추이 (P90)", "통과 소요 시간 추이"],
+        vertical_spacing=0.15,
+    )
+
+    # 1차 퇴근 (17시대) vs 2차 퇴근 (19시대) 분리
+    e1 = events_df[events_df["gate_open"].str.startswith("17")]
+    e2 = events_df[events_df["gate_open"].str.startswith("19")]
+
+    for df_sub, name, color in [(e1, "1차 (~17:30)", COLORS["primary"]),
+                                 (e2, "2차 (~19:30)", COLORS["secondary"])]:
+        if df_sub.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=df_sub["date"], y=df_sub["wait_p90"],
+            mode="lines+markers", name=f"{name} P90 대기",
+            line=dict(color=color, width=2),
+            hovertemplate="%{x}<br>P90: %{y}분<extra></extra>",
+        ), row=1, col=1)
+
+        fig.add_trace(go.Scatter(
+            x=df_sub["date"], y=df_sub["drain_minutes"],
+            mode="lines+markers", name=f"{name} 통과",
+            line=dict(color=color, width=2),
+            hovertemplate="%{x}<br>통과: %{y}분<extra></extra>",
+        ), row=2, col=1)
+
+    fig.update_yaxes(title_text="대기 P90 (분)", row=1, col=1)
+    fig.update_yaxes(title_text="통과 소요 (분)", row=2, col=1)
+    fig.update_layout(**_base_layout(
+        title="일별 대기 시간 · 통과 시간 추이",
+        height=600,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    ))
+    return fig
+
+
+def create_gate_events_by_dow(events_df: pd.DataFrame) -> go.Figure:
+    """요일별 대기 시간 + 통과 시간 박스플롯."""
+    if events_df.empty:
+        return go.Figure()
+
+    dow_order = ["월", "화", "수", "목", "금", "토", "일"]
+    df = events_df.copy()
+    df["day_order"] = df["day_name_kr"].map({d: i for i, d in enumerate(dow_order)})
+    df = df.sort_values("day_order")
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=["대기 시간 (P90, 분)", "통과 소요 시간 (분)"],
+        horizontal_spacing=0.1,
+    )
+
+    fig.add_trace(go.Box(
+        x=df["day_name_kr"], y=df["wait_p90"],
+        name="대기 P90",
+        marker_color=COLORS["primary"],
+        boxmean=True,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Box(
+        x=df["day_name_kr"], y=df["drain_minutes"],
+        name="통과 소요",
+        marker_color=COLORS["secondary"],
+        boxmean=True,
+    ), row=1, col=2)
+
+    fig.update_xaxes(categoryorder="array", categoryarray=dow_order, row=1, col=1)
+    fig.update_xaxes(categoryorder="array", categoryarray=dow_order, row=1, col=2)
+    fig.update_layout(**_base_layout(
+        title="요일별 대기 시간 · 통과 시간",
+        height=400, showlegend=False,
+    ))
+    return fig
+
+
+def create_gate_events_scatter(events_df: pd.DataFrame) -> go.Figure:
+    """피크 DC vs 대기 시간 / 통과 시간 산점도."""
+    if events_df.empty:
+        return go.Figure()
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=["피크 DC vs 대기 P90", "피크 DC vs 통과 소요"],
+        horizontal_spacing=0.1,
+    )
+
+    day_type_colors = {"평일": COLORS["primary"], "주말": COLORS["secondary"], "공휴일": COLORS["holiday"]}
+
+    for dt_name, dt_color in day_type_colors.items():
+        sub = events_df[events_df["day_type"] == dt_name]
+        if sub.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=sub["peak_dc"], y=sub["wait_p90"],
+            mode="markers", name=dt_name,
+            marker=dict(color=dt_color, size=8, opacity=0.7),
+            hovertemplate="%{customdata}<br>피크DC: %{x}<br>대기P90: %{y}분<extra></extra>",
+            customdata=sub["date"],
+        ), row=1, col=1)
+
+        fig.add_trace(go.Scatter(
+            x=sub["peak_dc"], y=sub["drain_minutes"],
+            mode="markers", name=dt_name,
+            marker=dict(color=dt_color, size=8, opacity=0.7),
+            showlegend=False,
+            hovertemplate="%{customdata}<br>피크DC: %{x}<br>통과: %{y}분<extra></extra>",
+            customdata=sub["date"],
+        ), row=1, col=2)
+
+    fig.update_xaxes(title_text="피크 DC", row=1, col=1)
+    fig.update_xaxes(title_text="피크 DC", row=1, col=2)
+    fig.update_yaxes(title_text="대기 P90 (분)", row=1, col=1)
+    fig.update_yaxes(title_text="통과 소요 (분)", row=1, col=2)
+    fig.update_layout(**_base_layout(
+        title="인원 규모 vs 대기/통과 시간 (평일·주말 비교)",
+        height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    ))
     return fig

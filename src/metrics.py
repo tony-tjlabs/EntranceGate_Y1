@@ -414,140 +414,304 @@ def _bin_to_time(time_bin: int) -> str:
     return f"{time_bin // 60:02d}:{time_bin % 60:02d}"
 
 
-# ── 트래픽 기반 대기 시간 추정 ─────────────────────────────────────────────
+# ── 출근 흐름 분석 ────────────────────────────────────────────────────────
+
+
+def analyze_entry_flow(
+    fine_df: pd.DataFrame,
+    gate_flow_df: pd.DataFrame,
+    date: str,
+    entry_start_hour: int = 3,
+    entry_end_hour: int = 9,
+    rush_ratio: float = 0.2,
+) -> dict | None:
+    """출근 흐름 분석 — 혼잡도(넓은) + 처리량(좁은) 결합.
+
+    - 혼잡도: fine_df (넓은 RSSI) → 타각기 근처 인원수, 피크
+    - 처리량: gate_flow_df (좁은 RSSI, MAC 추적) → 분당 실제 통과 인원
+
+    Returns:
+        dict: 러시 구간, 피크 혼잡도, 분당 유입/유출 속도
+    """
+    # ── 혼잡도 (넓은 범위) ──
+    day = fine_df[fine_df["date"] == date].sort_values("time_bin")
+    start_bin = entry_start_hour * 60
+    end_bin = entry_end_hour * 60
+    morning = day[(day["time_bin"] >= start_bin) & (day["time_bin"] <= end_bin)]
+
+    if morning.empty or morning["dc"].max() < 10:
+        return None
+
+    dc_series = morning.set_index("time_bin")["dc"]
+
+    # 피크 혼잡도
+    peak_bin = int(dc_series.idxmax())
+    peak_crowd = int(dc_series.max())
+
+    # 러시 = 피크의 N% 이상
+    rush_threshold = peak_crowd * rush_ratio
+    rush_bins = dc_series[dc_series >= rush_threshold]
+    if not rush_bins.empty:
+        rush_start = int(rush_bins.index.min())
+        rush_end = int(rush_bins.index.max())
+        rush_duration = rush_end - rush_start + 5
+    else:
+        rush_start = peak_bin
+        rush_end = peak_bin
+        rush_duration = 0
+
+    # ── 처리량 (좁은 범위, MAC 추적) ──
+    gf_day = gate_flow_df[gate_flow_df["date"] == date].sort_values("time_bin") if not gate_flow_df.empty else pd.DataFrame()
+    gf_morning = gf_day[(gf_day["time_bin"] >= start_bin) & (gf_day["time_bin"] <= end_bin)] if not gf_day.empty else pd.DataFrame()
+
+    if not gf_morning.empty:
+        gf_rush = gf_morning[(gf_morning["time_bin"] >= rush_start) & (gf_morning["time_bin"] <= rush_end)]
+        avg_throughput = round(float(gf_rush["flow_per_min"].mean()), 1) if not gf_rush.empty else 0
+        peak_throughput = round(float(gf_rush["flow_per_min"].max()), 1) if not gf_rush.empty else 0
+        avg_inflow = round(float(gf_rush["inflow_per_min"].mean()), 1) if not gf_rush.empty else 0
+        peak_inflow = round(float(gf_rush["inflow_per_min"].max()), 1) if not gf_rush.empty else 0
+    else:
+        avg_throughput = peak_throughput = avg_inflow = peak_inflow = 0
+
+    return {
+        "peak_time": _bin_to_time(peak_bin),
+        "peak_bin": peak_bin,
+        "peak_crowd": peak_crowd,
+        "rush_start": _bin_to_time(rush_start),
+        "rush_start_bin": rush_start,
+        "rush_end": _bin_to_time(rush_end),
+        "rush_end_bin": rush_end,
+        "rush_duration": rush_duration,
+        "avg_throughput": avg_throughput,
+        "peak_throughput": peak_throughput,
+        "avg_inflow": avg_inflow,
+        "peak_inflow": peak_inflow,
+    }
+
+
+def compute_all_entry_flows(fine_df: pd.DataFrame) -> pd.DataFrame:
+    """전체 기간 출근 흐름 요약."""
+    DAY_KR = {0: "월", 1: "화", 2: "수", 3: "목", 4: "금", 5: "토", 6: "일"}
+    rows = []
+    for d in sorted(fine_df["date"].unique()):
+        result = analyze_entry_flow(fine_df, d)
+        if result is None:
+            continue
+        dt = pd.to_datetime(d)
+        rows.append({
+            "date": d,
+            "day_name_kr": DAY_KR.get(dt.dayofweek, ""),
+            "day_type": get_day_type(d),
+            **result,
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+# ── 퇴근 대기 시간 추정 ──────────────────────────────────────────────────
+
+# 건설현장 퇴근 게이트 오픈 시간 (현장 운영 규칙)
+GATE_OPEN_TIMES = [
+    (17, 30),  # 1차 퇴근
+    (19, 30),  # 2차 퇴근
+]
+
+
+def _compute_baseline(dc_series: pd.Series) -> float:
+    """배경 트래픽 베이스라인 산출 (15:00~16:00 중앙값).
+
+    15시대가 가장 안정적 (점심 잔류 해소, 퇴근 모임 전).
+    타각기 주변을 지나다니는 사람들의 신호로, 출퇴근과 무관한 배경 수준.
+    """
+    bg = dc_series[(dc_series.index >= 15 * 60) & (dc_series.index < 16 * 60)]
+    if bg.empty:
+        return 0
+    return float(bg.median())
+
 
 def detect_gate_openings(
     fine_df: pd.DataFrame,
     date: str,
-    search_start_hour: int = 16,
-    search_end_hour: int = 21,
-    drop_threshold: float = 0.3,
+    gate_flow_df: pd.DataFrame | None = None,
+    gate_times: list[tuple[int, int]] | None = None,
 ) -> list[dict]:
-    """게이트 오픈 시점 자동 탐지.
+    """고정 게이트 오픈 시간 기반 이벤트 분석.
 
-    DC가 피크 대비 급락하는 시점을 게이트 오픈으로 식별한다.
-    연속적인 오픈 이벤트(1차/2차 퇴근)를 각각 반환.
+    혼잡도(넓은 RSSI) + 처리량(좁은 RSSI, MAC 추적) 결합.
 
     Returns:
-        list of dict: gate_open_bin, peak_bin, peak_dc, drop_dc, gathering_start_bin
+        list of dict per gate event
     """
-    day = fine_df[fine_df["date"] == date].sort_values("time_bin")
-    search_start = search_start_hour * 60
-    search_end = search_end_hour * 60
-    evening = day[(day["time_bin"] >= search_start) & (day["time_bin"] <= search_end)]
+    if gate_times is None:
+        gate_times = GATE_OPEN_TIMES
 
-    if evening.empty or evening["dc"].max() < 30:
+    day = fine_df[fine_df["date"] == date].sort_values("time_bin")
+    if day.empty or day["dc"].max() < 30:
         return []
 
-    dc_series = evening.set_index("time_bin")["dc"]
-    diff = dc_series.diff()
+    dc_series = day.set_index("time_bin")["dc"]
+    baseline = _compute_baseline(dc_series)
 
-    # 피크 DC 기준 급락 탐지
+    # gate_flow (좁은 RSSI) 준비
+    gf_day = None
+    if gate_flow_df is not None and not gate_flow_df.empty:
+        gf_day = gate_flow_df[gate_flow_df["date"] == date].set_index("time_bin")
+
     events = []
-    used_bins = set()
+    for h, m in gate_times:
+        gate_bin = h * 60 + m
 
-    # 전체 피크 DC의 일정 비율 이상만 의미있는 이벤트로 취급
-    overall_peak_dc = dc_series.max()
-    min_peak_dc = max(200, overall_peak_dc * 0.25)
-
-    # 큰 급락 순서로 이벤트 찾기
-    drops = diff[diff < 0].sort_values()
-    for drop_bin, drop_val in drops.items():
-        # 이미 처리된 이벤트 근처 건너뛰기 (±30분)
-        if any(abs(drop_bin - ub) < 30 for ub in used_bins):
+        # 오픈 시점 ±10분 내 실제 피크 DC 찾기
+        nearby_bins = [b for b in dc_series.index if abs(b - gate_bin) <= 10]
+        if not nearby_bins:
             continue
 
-        # 급락 직전이 피크 (게이트 오픈 직전 최고 밀집)
-        peak_bin = drop_bin - 5  # 직전 5분 빈
-        if peak_bin not in dc_series.index:
+        actual_peak_bin = max(nearby_bins, key=lambda b: dc_series[b])
+        raw_peak_dc = int(dc_series[actual_peak_bin])
+        net_peak_dc = max(0, raw_peak_dc - int(baseline))
+
+        if net_peak_dc < 50:  # 배경 차감 후에도 유의미해야
             continue
 
-        peak_dc = dc_series[peak_bin]
-        if peak_dc < min_peak_dc:  # 전체 피크 대비 유의미한 크기만
-            continue
+        # 모임 시작: 배경 대비 DC가 의미있게 올라가기 시작한 시점
+        search_start = max(0, gate_bin - 90)
+        gathering_start = _find_gathering_start(dc_series, actual_peak_bin, search_start, baseline)
 
-        # 급락 비율 확인
-        drop_ratio = abs(drop_val) / peak_dc
-        if drop_ratio < drop_threshold:
-            continue
+        # 빠져나감 완료: 오픈 후 DC가 배경 수준으로 복귀
+        search_end = gate_bin + 60
+        drain_start_bin = gate_bin + 5
+        clear_bin = _find_clear_end(dc_series, drain_start_bin, search_end, baseline)
 
-        # 모임 시작 탐지: 피크에서 역방향으로 DC가 지속 증가하기 시작한 시점
-        gathering_start = _find_gathering_start(dc_series, peak_bin, search_start)
+        drain_minutes = max(5, (clear_bin - gate_bin) // 5 * 5)
+
+        # 유출 속도: 오픈~완료 구간의 5분 단위 DC 감소량에서 산출
+        drain_bins = sorted(b for b in dc_series.index if gate_bin <= b <= clear_bin)
+        total_outflow = 0
+        peak_outflow_per_min = 0.0
+        for j in range(1, len(drain_bins)):
+            prev_net = max(0, dc_series[drain_bins[j-1]] - baseline)
+            curr_net = max(0, dc_series[drain_bins[j]] - baseline)
+            outflow = max(0, prev_net - curr_net)  # 감소분 = 빠져나간 인원
+            total_outflow += outflow
+            per_min = outflow / 5
+            if per_min > peak_outflow_per_min:
+                peak_outflow_per_min = per_min
+
+        avg_drain_per_min = round(total_outflow / drain_minutes, 1) if drain_minutes > 0 else 0
+        peak_drain_per_min = round(peak_outflow_per_min, 1)
+
+        # gate_flow 기반 실제 유출 속도 (좁은 RSSI, MAC 추적)
+        gf_avg_outflow = 0.0
+        gf_peak_outflow = 0.0
+        if gf_day is not None:
+            gf_drain = gf_day[(gf_day.index >= gate_bin) & (gf_day.index <= clear_bin)]
+            if not gf_drain.empty:
+                gf_avg_outflow = round(float(gf_drain["outflow_per_min"].mean()), 1)
+                gf_peak_outflow = round(float(gf_drain["outflow_per_min"].max()), 1)
 
         events.append({
-            "gate_open_bin": int(drop_bin),
-            "gate_open_time": _bin_to_time(int(drop_bin)),
-            "peak_bin": int(peak_bin),
-            "peak_time": _bin_to_time(int(peak_bin)),
-            "peak_dc": int(peak_dc),
-            "drop_dc": int(abs(drop_val)),
+            "gate_open_bin": gate_bin,
+            "gate_open_time": _bin_to_time(gate_bin),
+            "peak_dc": net_peak_dc,
+            "raw_peak_dc": raw_peak_dc,
+            "baseline_dc": int(baseline),
             "gathering_start_bin": int(gathering_start),
             "gathering_start_time": _bin_to_time(int(gathering_start)),
+            "clear_bin": int(clear_bin),
+            "clear_time": _bin_to_time(int(clear_bin)),
+            "drain_minutes": drain_minutes,
+            "avg_drain_per_min": avg_drain_per_min,
+            "peak_drain_per_min": peak_drain_per_min,
+            "gf_avg_outflow": gf_avg_outflow,
+            "gf_peak_outflow": gf_peak_outflow,
         })
-        used_bins.add(drop_bin)
 
-        if len(events) >= 3:  # 최대 3회 퇴근
-            break
-
-    return sorted(events, key=lambda x: x["gate_open_bin"])
+    return events
 
 
-def _find_gathering_start(dc_series: pd.Series, peak_bin: int, min_bin: int) -> int:
-    """피크에서 역방향으로 DC 축적 시작 시점 탐지.
+def _find_gathering_start(
+    dc_series: pd.Series, peak_bin: int, min_bin: int,
+    baseline: float = 0, gather_ratio: float = 0.2,
+) -> int:
+    """모임 시작 = 배경 대비 순수 피크의 N% 인원이 추가로 관측되는 시점.
 
-    DC가 지속적으로 감소하기 시작하는 시점 (= 모임 시작 직전).
+    예: baseline=60, peak=900, net_peak=840, ratio=0.2
+    → threshold = 60 + 840 * 0.2 = 228
+    → DC > 228이 되는 시점부터 "퇴근을 위해 모이기 시작"
     """
     bins = sorted(dc_series.index)
     peak_idx = bins.index(peak_bin) if peak_bin in bins else 0
 
-    # 피크에서 역방향 탐색
-    baseline_dc = dc_series[peak_bin] * 0.15  # 피크의 15%를 기준
+    peak_dc = dc_series[peak_bin]
+    net_peak = peak_dc - baseline
+    threshold = baseline + net_peak * gather_ratio
+
     for i in range(peak_idx, -1, -1):
         b = bins[i]
         if b < min_bin:
-            return min_bin
-        if dc_series[b] <= baseline_dc:
-            return b
+            return bins[min(i + 1, peak_idx)] if i + 1 <= peak_idx else min_bin
+        if dc_series[b] <= threshold:
+            # threshold 이하 → 다음 빈(threshold를 넘는 첫 시점)이 모임 시작
+            return bins[i + 1] if i + 1 <= peak_idx else b
     return min_bin
+
+
+def _find_clear_end(
+    dc_series: pd.Series, drop_bin: int, max_bin: int,
+    baseline: float = 0, clear_ratio: float = 1.3,
+) -> int:
+    """퇴근 완료 = DC가 배경 수준에 근접하게 내려온 시점.
+
+    배경 × clear_ratio 이하로 내려오면 퇴근 완료로 판정.
+    (0이 될 수 없으므로 배경 근접을 기준으로 함)
+    """
+    bins = sorted(dc_series.index)
+    drop_idx = bins.index(drop_bin) if drop_bin in bins else len(bins) - 1
+    threshold = baseline * clear_ratio if baseline > 0 else 50
+
+    for i in range(drop_idx, len(bins)):
+        b = bins[i]
+        if b > max_bin:
+            return max_bin
+        if dc_series[b] <= threshold:
+            return b
+    return min(drop_bin + 30, max_bin)
 
 
 def estimate_wait_time_distribution(
     fine_df: pd.DataFrame,
     date: str,
+    gate_flow_df: pd.DataFrame | None = None,
 ) -> list[dict]:
-    """트래픽 기반 대기 시간 분포 추정.
-
-    게이트 오픈 시점을 탐지하고, 각 5분 빈의 신규 도착 인원에
-    대기 시간(= 게이트 오픈 시각 - 도착 시각)을 부여한다.
+    """트래픽 기반 대기 시간 분포 추정 + 게이트 유출 속도.
 
     Returns:
         list of dict (per gate event):
-            - event: dict (gate_open_time, peak_dc, ...)
+            - event: dict (gate_open_time, peak_dc, drain, flow rates)
             - distribution: list of (wait_minutes, estimated_people)
             - stats: dict (median, p75, p90, p95, max, total_people)
     """
-    events = detect_gate_openings(fine_df, date)
+    events = detect_gate_openings(fine_df, date, gate_flow_df)
     if not events:
         return []
 
     day = fine_df[fine_df["date"] == date].sort_values("time_bin")
     dc_series = day.set_index("time_bin")["dc"]
+    baseline = _compute_baseline(dc_series)
 
     results = []
     for evt in events:
         gate_bin = evt["gate_open_bin"]
         gather_bin = evt["gathering_start_bin"]
 
-        # 모임 구간의 각 5분 빈에서 신규 도착 추정
+        # 모임 구간의 각 5분 빈에서 신규 도착 추정 (배경 차감)
         distribution = []
         bins_in_range = sorted(b for b in dc_series.index if gather_bin <= b <= gate_bin)
 
-        prev_dc = 0
+        prev_net_dc = 0
         for b in bins_in_range:
-            current_dc = dc_series[b]
-            # 신규 도착 = DC 증가분 (양수만, 감소는 이탈)
-            new_arrivals = max(0, current_dc - prev_dc)
-            wait_minutes = (gate_bin - b) // 5 * 5  # 5분 단위
+            net_dc = max(0, dc_series[b] - baseline)  # 배경 차감
+            new_arrivals = max(0, net_dc - prev_net_dc)
+            wait_minutes = (gate_bin - b) // 5 * 5
             if new_arrivals > 0 and wait_minutes >= 0:
                 distribution.append({
                     "arrival_time": _bin_to_time(b),
@@ -555,7 +719,7 @@ def estimate_wait_time_distribution(
                     "wait_minutes": wait_minutes,
                     "estimated_people": int(new_arrivals),
                 })
-            prev_dc = current_dc
+            prev_net_dc = net_dc
 
         if not distribution:
             continue
@@ -585,6 +749,43 @@ def estimate_wait_time_distribution(
         })
 
     return results
+
+
+def compute_all_gate_events(fine_df: pd.DataFrame, gate_flow_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """전체 기간 게이트 이벤트 ��약 테이블."""
+    DAY_KR = {0: "월", 1: "화", 2: "수", 3: "목", 4: "금", 5: "토", 6: "일"}
+    dates = sorted(fine_df["date"].unique())
+    rows = []
+
+    for d in dates:
+        waits = estimate_wait_time_distribution(fine_df, d, gate_flow_df)
+        dt = pd.to_datetime(d)
+        day_type = get_day_type(d)
+
+        for i, w in enumerate(waits):
+            evt = w["event"]
+            s = w["stats"]
+            rows.append({
+                "date": d,
+                "dayofweek": dt.dayofweek,
+                "day_name_kr": DAY_KR.get(dt.dayofweek, ""),
+                "day_type": day_type,
+                "event_num": i + 1,
+                "gate_open": evt["gate_open_time"],
+                "gathering_start": evt["gathering_start_time"],
+                "peak_dc": evt["peak_dc"],
+                "drain_minutes": evt.get("drain_minutes", 0),
+                "gf_avg_outflow": evt.get("gf_avg_outflow", 0),
+                "gf_peak_outflow": evt.get("gf_peak_outflow", 0),
+                "wait_median": s["median"],
+                "wait_p75": s["p75"],
+                "wait_p90": s["p90"],
+                "wait_p95": s["p95"],
+                "wait_max": s["max"],
+                "total_people": s["total_people"],
+            })
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 def add_day_metadata(daily_df: pd.DataFrame) -> pd.DataFrame:
