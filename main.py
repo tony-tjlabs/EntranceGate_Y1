@@ -117,10 +117,8 @@ with st.sidebar:
     meta = load_meta(CACHE_DIR)
 
     if meta:
-        st.success(f"캐시 로드됨 ({meta['days']}일)")
+        st.success(f"데이터 로드됨 ({meta['days']}일)")
         st.caption(f"기간: {meta['date_range'][0]} ~ {meta['date_range'][1]}")
-    else:
-
 
     st.divider()
 
