@@ -826,3 +826,119 @@ def create_gateway_correlation(gw_hourly_df: pd.DataFrame) -> go.Figure:
         )
     )
     return fig
+
+
+# ── 트래픽 기반 대기 시간 차트 ──────────────────────────────────────────────
+
+def create_wait_time_chart(wait_results: list[dict]) -> go.Figure | None:
+    """퇴근 대기 시간 분포 차트 (트래픽 기반 추정).
+
+    각 게이트 오픈 이벤트별로 도착 시각 vs 추정 인원 막대 + 백분위 주석.
+    """
+    if not wait_results:
+        return None
+
+    n = len(wait_results)
+    fig = make_subplots(
+        rows=n, cols=1,
+        subplot_titles=[
+            f"{r['event']['gate_open_time']} 게이트 오픈 (피크 DC {r['event']['peak_dc']:,})"
+            for r in wait_results
+        ],
+        vertical_spacing=0.15 if n > 1 else 0.1,
+    )
+
+    palette = ["#4A90D9", "#F5A623", "#50C878"]
+
+    for i, result in enumerate(wait_results):
+        dist = result["distribution"]
+        stats = result["stats"]
+        row = i + 1
+
+        arrival_times = [d["arrival_time"] for d in dist]
+        wait_mins = [d["wait_minutes"] for d in dist]
+        people = [d["estimated_people"] for d in dist]
+
+        fig.add_trace(go.Bar(
+            x=arrival_times, y=people,
+            name=f"{result['event']['gate_open_time']} 오픈",
+            marker_color=palette[i % len(palette)],
+            text=[f"{w}분" for w in wait_mins],
+            textposition="outside",
+            textfont=dict(size=10),
+            hovertemplate="도착: %{x}<br>추정 인원: %{y}명<br>대기: %{text}<extra></extra>",
+        ), row=row, col=1)
+
+        # 백분위 주석
+        ann = (
+            f"중앙값 {stats['median']}분 | "
+            f"P75 {stats['p75']}분 | "
+            f"P90 {stats['p90']}분 | "
+            f"P95 {stats['p95']}분 | "
+            f"최대 {stats['max']}분 | "
+            f"총 {stats['total_people']:,}명"
+        )
+        fig.add_annotation(
+            text=ann,
+            xref=f"x{row} domain", yref=f"y{row} domain",
+            x=0.5, y=1.0,
+            xanchor="center", yanchor="bottom",
+            showarrow=False,
+            font=dict(size=11, color="#8892b0"),
+        )
+
+        fig.update_yaxes(title_text="추정 인원", row=row, col=1)
+
+    fig.update_layout(
+        **_base_layout(
+            title="퇴근 대기 시간 분포 (트래픽 패턴 기반 추정)",
+            height=max(350, 300 * n),
+        ),
+        showlegend=False,
+    )
+    return fig
+
+
+def create_gate_flow_chart(fine_df: pd.DataFrame, date: str, events: list[dict]) -> go.Figure | None:
+    """게이트 오픈 전후 DC 흐름 + 모임/오픈 시점 마커."""
+    day = fine_df[fine_df["date"] == date].sort_values("time_bin")
+    evening = day[(day["time_bin"] >= 15 * 60) & (day["time_bin"] <= 21 * 60)]
+
+    if evening.empty:
+        return None
+
+    times = evening["time_bin"].apply(lambda x: f"{x // 60:02d}:{x % 60:02d}")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=times, y=evening["dc"],
+        mode="lines+markers",
+        name="DC (5분 단위)",
+        line=dict(color=COLORS["primary"], width=2.5),
+        fill="tozeroy", fillcolor="rgba(74,144,217,0.15)",
+    ))
+
+    for evt in events:
+        fig.add_vline(
+            x=evt["gate_open_time"],
+            line_dash="dash", line_color="#E85D75", line_width=2,
+            annotation_text=f"게이트 오픈 {evt['gate_open_time']}",
+            annotation_position="top",
+            annotation_font_color="#E85D75",
+        )
+        fig.add_vline(
+            x=evt["gathering_start_time"],
+            line_dash="dot", line_color="#F5A623", line_width=1.5,
+            annotation_text=f"모임 시작 {evt['gathering_start_time']}",
+            annotation_position="top left",
+            annotation_font_color="#F5A623",
+        )
+
+    fig.update_layout(
+        **_base_layout(
+            title=f"{date} 퇴근 흐름 — 모임 → 게이트 오픈 → 빠져나감",
+            xaxis_title="시간",
+            yaxis_title="DC (5분 unique MAC)",
+        )
+    )
+    return fig

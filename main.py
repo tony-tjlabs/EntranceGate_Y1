@@ -1,24 +1,29 @@
-"""Y1 건설현장 출입구 트래픽 분석 대시보드 (배포용).
+"""Entrance_Analysis_Y1 -- Y1 건설현장 출입구 트래픽 분석 대시보드.
 
-캐시 Parquet 전용 — 전처리 코드 없음.
+실행:
+    cd SandBox/Entrance_Analysis_Y1
+    streamlit run main.py --server.port 8550
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import streamlit as st
 import pandas as pd
 
 from src.data_loader import (
-    is_cache_valid, load_daily_summary, load_hourly_summary,
-    load_gateway_summary, load_gateway_daily, load_fine_summary,
-    load_dwell_times, load_meta,
+    is_cache_valid,
+    load_daily_summary, load_hourly_summary, load_gateway_summary,
+    load_gateway_daily, load_fine_summary, load_dwell_times, load_meta,
 )
 from src.metrics import (
     compute_overview_metrics, compute_peak_analysis, compute_weekly_trend,
     compute_monthly_comparison, compute_gateway_stats, add_day_metadata,
     estimate_exit_headcount, compute_daily_exit_headcount,
-    compute_entry_headcount, compute_daily_commute_times, SPECIAL_DAYS,
+    compute_entry_headcount, compute_daily_commute_times,
+    detect_gate_openings, estimate_wait_time_distribution,
+    SPECIAL_DAYS,
 )
 from src.charts import (
     create_daily_udc_chart, create_device_ratio_chart,
@@ -28,11 +33,18 @@ from src.charts import (
     create_headcount_comparison_chart, create_entry_exit_comparison,
     create_multidate_comparison_chart, create_period_avg_chart,
     create_dwell_histogram, create_daily_dwell_chart,
-    create_intraday_fine_with_range, create_single_date_dwell_chart,
+    create_intraday_fine_with_range,
+    create_single_date_dwell_chart,
+    create_wait_time_chart, create_gate_flow_chart,
 )
 from src.llm_analyzer import is_llm_ready, analyze_daily_pattern, compare_dates_pattern
 
-CACHE_DIR = str(Path(__file__).parent / "Cache")
+# ── 경로 ────────────────────────────────────────────────────────────────────
+
+BASE_DIR = Path(__file__).parent
+CACHE_DIR = str(BASE_DIR / "Cache")
+
+# ── 페이지 설정 ─────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Y1 출입구 트래픽", page_icon="🏗️", layout="wide")
 
@@ -103,6 +115,7 @@ with st.sidebar:
     if meta:
         st.success(f"데이터 로드됨 ({meta['days']}일)")
         st.caption(f"기간: {meta['date_range'][0]} ~ {meta['date_range'][1]}")
+
     st.divider()
 
 # ── 데이터 로드 ─────────────────────────────────────────────────────────────
@@ -136,11 +149,17 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**출퇴근 시간 설정**")
-    entry_range = st.slider("출근 시간대", 0, 12, (4, 8), format="%02d:00", key="entry_range")
-    exit_range = st.slider("퇴근 시간대", 12, 24, (17, 19), format="%02d:00", key="exit_range")
+    entry_range = st.slider(
+        "출근 시간대", min_value=0, max_value=12, value=(4, 8),
+        step=1, format="%02d:00", key="entry_range",
+    )
+    exit_range = st.slider(
+        "퇴근 시간대", min_value=12, max_value=24, value=(17, 19),
+        step=1, format="%02d:00", key="exit_range",
+    )
 
     st.divider()
-    st.markdown("**RSSI 필터** (전처리 적용됨)")
+    st.markdown("**RSSI 필터** (캐시에 적용됨)")
     st.caption("iOS: ≥ -70 dBm / Android: ≥ -80 dBm")
 
     st.divider()
@@ -152,7 +171,7 @@ with st.sidebar:
     if llm_ready:
         st.success("Claude API 연결됨")
     else:
-        st.caption("AI: ANTHROPIC_API_KEY 설정 필요")
+        st.caption("AI 분석: .env에 ANTHROPIC_API_KEY 설정 필요")
 
 # ── 날짜 범위 필터 ────────────────────────────────────────────────────────
 
@@ -163,6 +182,7 @@ gw_hourly_f = gw_hourly_df[(gw_hourly_df["date"] >= ds) & (gw_hourly_df["date"] 
 gw_daily_f = gw_daily_df[(gw_daily_df["date"] >= ds) & (gw_daily_df["date"] <= de)].copy()
 fine_f = fine_df[(fine_df["date"] >= ds) & (fine_df["date"] <= de)].copy()
 
+# 체류시간: 사이드바 설정 반영
 if not dwell_df.empty:
     dwell_f = dwell_df[(dwell_df["date"] >= ds) & (dwell_df["date"] <= de)].copy()
     if iphone_only_dwell:
@@ -174,7 +194,7 @@ if daily_f.empty:
     st.warning("선택한 기간에 데이터가 없습니다.")
     st.stop()
 
-# ── 사전 계산 ─────────────────────────────────────────────────────────────
+# ── 사전 계산 (출퇴근 시간 설정 반영) ────────────────────────────────────
 
 exit_fine = estimate_exit_headcount(fine_f, exit_range[0], 0, exit_range[1], 0)
 daily_exit = compute_daily_exit_headcount(fine_f, exit_start_hour=exit_range[0],
@@ -218,6 +238,7 @@ with tab1:
 
         st.markdown("")
 
+        # 날짜별 테이블
         display_cols = day_summary[[
             "date", "day_name_kr", "day_type",
             "entry_start", "entry_peak", "exit_peak", "exit_end",
@@ -228,11 +249,13 @@ with tab1:
             "추정 인원", "출근 피크 DC", "퇴근 피크 DC", "활성(시간)"
         ]
 
+        # 체류시간 추가
         if not dwell_f.empty:
             entry_dwell_daily = dwell_f[dwell_f["period"] == "entry"].groupby("date")["dwell_sec"].median().reset_index()
             entry_dwell_daily["dwell_min"] = (entry_dwell_daily["dwell_sec"] / 60).round(1)
             exit_dwell_daily = dwell_f[dwell_f["period"] == "exit"].groupby("date")["dwell_sec"].median().reset_index()
             exit_dwell_daily["dwell_min"] = (exit_dwell_daily["dwell_sec"] / 60).round(1)
+
             display_cols = display_cols.merge(
                 entry_dwell_daily[["date", "dwell_min"]].rename(columns={"date": "날짜", "dwell_min": "출근 체류(분)"}),
                 on="날짜", how="left"
@@ -243,16 +266,21 @@ with tab1:
 
         st.dataframe(display_cols, use_container_width=True, hide_index=True)
 
+        # 날짜별 5분 단위 트래픽 + 시간 슬라이더
         st.markdown('<div class="section-header">날짜별 5분 단위 트래픽</div>', unsafe_allow_html=True)
         avail_dates = sorted(day_summary["date"].unique())
         sel_date = st.selectbox("날짜 선택", avail_dates, index=len(avail_dates) - 1, key="day_select")
         if sel_date:
-            hour_range = st.slider("시간 범위", 0, 24, (0, 24), format="%02d:00", key="hour_slider")
+            hour_range = st.slider(
+                "시간 범위", min_value=0, max_value=24, value=(0, 24),
+                step=1, format="%02d:00", key="hour_slider",
+            )
             st.plotly_chart(
                 create_intraday_fine_with_range(fine_f, sel_date, hour_range[0], hour_range[1]),
                 use_container_width=True,
             )
 
+            # 해당 날짜 체류시간
             if not dwell_f.empty:
                 day_dwell = dwell_f[dwell_f["date"] == sel_date]
                 if not day_dwell.empty:
@@ -261,15 +289,69 @@ with tab1:
                     c1, c2, c3 = st.columns(3)
                     with c1:
                         v = entry_d["dwell_sec"].median() / 60 if not entry_d.empty else 0
-                        render_metric_card("출근 체류", f"{v:.1f}분", f"중앙값 (n={len(entry_d):,})")
+                        n = len(entry_d)
+                        render_metric_card("출근 체류", f"{v:.1f}분", f"중앙값 (n={n:,})")
                     with c2:
                         v = exit_d["dwell_sec"].median() / 60 if not exit_d.empty else 0
-                        render_metric_card("퇴근 체류", f"{v:.1f}분", f"중앙값 (n={len(exit_d):,})")
+                        n = len(exit_d)
+                        render_metric_card("퇴근 체류", f"{v:.1f}분", f"중앙값 (n={n:,})")
                     with c3:
                         pct = (exit_d["dwell_sec"] > 300).mean() * 100 if not exit_d.empty else 0
                         render_metric_card("5분+ 대기", f"{pct:.0f}%", "퇴근 시간대")
                     st.plotly_chart(create_single_date_dwell_chart(dwell_f, sel_date),
                                    use_container_width=True, key="day_dwell_hist")
+
+            # 퇴근 대기 시간 분석 (트래픽 기반)
+            st.markdown('<div class="section-header">퇴근 대기 시간 분석</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="info-box">'
+                '게이트 오픈 시점을 DC 급락으로 자동 탐지하고, 모임 시작~오픈까지 '
+                '도착 인원별 대기 시간을 추정합니다. (MAC 추적 불필요)'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+            events = detect_gate_openings(fine_f, sel_date)
+            if events:
+                # 퇴근 흐름 차트 (모임→오픈 표시)
+                gate_fig = create_gate_flow_chart(fine_f, sel_date, events)
+                if gate_fig:
+                    st.plotly_chart(gate_fig, use_container_width=True, key="gate_flow")
+
+                # 대기 시간 분포
+                wait_results = estimate_wait_time_distribution(fine_f, sel_date)
+                if wait_results:
+                    # 이벤트별 메트릭 카드
+                    for idx, wr in enumerate(wait_results):
+                        evt = wr["event"]
+                        stats = wr["stats"]
+                        cols = st.columns(6)
+                        with cols[0]:
+                            render_metric_card(
+                                f"{idx+1}차 게이트 오픈", evt["gate_open_time"],
+                                f"피크 DC {evt['peak_dc']:,}")
+                        with cols[1]:
+                            render_metric_card("모임 시작", evt["gathering_start_time"],
+                                              f"피크까지 DC 축적")
+                        with cols[2]:
+                            render_metric_card("대기 중앙값", f"{stats['median']}분",
+                                              f"전체 {stats['total_people']:,}명")
+                        with cols[3]:
+                            render_metric_card("P75", f"{stats['p75']}분",
+                                              "75% 이하 대기")
+                        with cols[4]:
+                            render_metric_card("P90", f"{stats['p90']}분",
+                                              "90% 이하 대기")
+                        with cols[5]:
+                            render_metric_card("최대 대기", f"{stats['max']}분",
+                                              "가장 오래 기다린 그룹")
+
+                    wait_fig = create_wait_time_chart(wait_results)
+                    if wait_fig:
+                        st.plotly_chart(wait_fig, use_container_width=True, key="wait_dist")
+            else:
+                st.caption("해당 날짜에 게이트 오픈 이벤트가 탐지되지 않았습니다 (주말/공휴일 등).")
+
     else:
         st.warning("데이터가 부족합니다.")
 
@@ -277,8 +359,10 @@ with tab1:
 
 with tab2:
     avail_dates_all = sorted(fine_f["date"].unique())
+
     compare_dates = st.multiselect(
-        "비교할 날짜 선택 (최대 10일)", avail_dates_all,
+        "비교할 날짜 선택 (최대 10일)",
+        avail_dates_all,
         default=avail_dates_all[-3:] if len(avail_dates_all) >= 3 else avail_dates_all,
         max_selections=10, key="compare_dates",
     )
@@ -286,6 +370,7 @@ with tab2:
     if compare_dates:
         st.plotly_chart(create_multidate_comparison_chart(fine_f, compare_dates), use_container_width=True)
 
+        # 선택 기간 체류시간 비교
         if not dwell_f.empty:
             with st.expander("체류 시간 비교", expanded=False):
                 dwell_sel = dwell_f[dwell_f["date"].isin(compare_dates)]
@@ -314,8 +399,7 @@ with tab3:
         st.markdown(
             '<div class="info-box">'
             'Claude API가 연결되지 않았습니다.<br>'
-            'Streamlit Cloud: Settings → Secrets에 <code>ANTHROPIC_API_KEY</code> 추가<br>'
-            '로컬: <code>.env</code> 파일에 설정'
+            '<code>.env</code> 파일에 <code>ANTHROPIC_API_KEY=sk-ant-...</code>를 설정하세요.'
             '</div>', unsafe_allow_html=True,
         )
     else:
@@ -326,16 +410,26 @@ with tab3:
             '</div>', unsafe_allow_html=True,
         )
 
-    ai_mode = st.radio("분석 모드", ["날짜 분석", "날짜 비교"], horizontal=True, key="ai_mode")
+    ai_mode = st.radio(
+        "분석 모드",
+        ["날짜 분석", "날짜 비교"],
+        horizontal=True, key="ai_mode",
+    )
+
     avail_dates_ai = sorted(fine_f["date"].unique())
 
     if ai_mode == "날짜 분석":
-        ai_date = st.selectbox("날짜 선택", avail_dates_ai, index=len(avail_dates_ai) - 1, key="ai_date")
+        ai_date = st.selectbox("날짜 선택", avail_dates_ai,
+                                index=len(avail_dates_ai) - 1, key="ai_date")
+
         if ai_date:
+            # 해당 날짜 5분 단위 차트
             st.plotly_chart(
                 create_intraday_fine_with_range(fine_f, ai_date, 0, 24),
                 use_container_width=True, key="ai_intraday_chart",
             )
+
+            # 해당 날짜 기본 정보 카드
             if not commute_times.empty:
                 row = commute_times[commute_times["date"] == ai_date]
                 if not row.empty:
@@ -352,6 +446,7 @@ with tab3:
                     with c4:
                         render_metric_card("퇴근 종료", str(r.get("exit_end", "-")), "")
 
+            # LLM 분석
             if llm_ready:
                 if st.button("AI 분석 실행", key="run_ai_single", type="primary"):
                     commute_row = commute_times[commute_times["date"] == ai_date]
@@ -363,17 +458,20 @@ with tab3:
                     else:
                         st.warning("분석 결과를 생성하지 못했습니다.")
 
-    else:
+    else:  # 날짜 비교
         ai_compare = st.multiselect(
-            "비교할 날짜 선택 (2~5일)", avail_dates_ai,
+            "비교할 날짜 선택 (2~5일)",
+            avail_dates_ai,
             default=avail_dates_ai[-2:] if len(avail_dates_ai) >= 2 else avail_dates_ai,
             max_selections=5, key="ai_compare",
         )
+
         if ai_compare and len(ai_compare) >= 2:
             st.plotly_chart(
                 create_multidate_comparison_chart(fine_f, ai_compare),
                 use_container_width=True, key="ai_compare_chart",
             )
+
             if llm_ready:
                 if st.button("AI 비교 분석 실행", key="run_ai_compare", type="primary"):
                     with st.spinner("Claude가 비교 분석 중..."):
@@ -436,7 +534,7 @@ with tab5:
             with c1:
                 render_metric_card("캐시 버전", meta["cache_version"], f"생성: {meta['created_at'][:10]}")
             with c2:
-                render_metric_card("총 행", f"{meta['total_rows']:,}", "RSSI 필터 적용")
+                render_metric_card("총 행", f"{meta['total_rows']:,}", "원본 CSV")
             with c3:
                 render_metric_card("기간", f"{meta['days']}일",
                                   f"{meta['date_range'][0]} ~ {meta['date_range'][1]}")
