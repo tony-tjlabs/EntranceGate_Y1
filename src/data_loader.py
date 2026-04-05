@@ -8,7 +8,7 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-CACHE_VERSION = "6.1"
+CACHE_VERSION = "6.2"
 
 
 def is_cache_valid(cache_dir: str) -> bool:

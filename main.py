@@ -24,7 +24,7 @@ from src.metrics import (
     compute_entry_headcount, compute_daily_commute_times,
     detect_gate_openings, estimate_wait_time_distribution,
     compute_all_gate_events, analyze_entry_flow, compute_all_entry_flows,
-    SPECIAL_DAYS,
+    fetch_weather, WEATHER_EMOJI, SPECIAL_DAYS,
 )
 from src.charts import (
     create_daily_udc_chart, create_device_ratio_chart,
@@ -37,7 +37,10 @@ from src.charts import (
     create_wait_time_chart, create_gate_flow_chart, create_entry_flow_chart,
     create_gate_events_trend, create_gate_events_by_dow, create_gate_events_scatter,
 )
-from src.llm_analyzer import is_llm_ready, analyze_daily_pattern, compare_dates_pattern
+from src.llm_analyzer import (
+    is_llm_ready, analyze_daily_pattern, compare_dates_pattern,
+    _build_period_summary,
+)
 
 # ── 경로 ────────────────────────────────────────────────────────────────────
 
@@ -112,9 +115,13 @@ with st.sidebar:
     st.divider()
 
     meta = load_meta(CACHE_DIR)
+
     if meta:
-        st.success(f"데이터 로드됨 ({meta['days']}일)")
+        st.success(f"캐시 로드됨 ({meta['days']}일)")
         st.caption(f"기간: {meta['date_range'][0]} ~ {meta['date_range'][1]}")
+    else:
+
+
     st.divider()
 
 # ── 데이터 로드 ─────────────────────────────────────────────────────────────
@@ -131,6 +138,30 @@ fine_df = load_fine_summary(CACHE_DIR)
 gate_flow_df = load_gate_flow(CACHE_DIR)
 
 daily_df = add_day_metadata(daily_df)
+
+# 날씨 데이터 (Open-Meteo, 24시간 캐시)
+all_dates_for_weather = sorted(daily_df["date"].unique())
+weather_df = fetch_weather(all_dates_for_weather[0], all_dates_for_weather[-1])
+weather_map = {}
+if not weather_df.empty:
+    weather_map = weather_df.set_index("date").to_dict("index")
+
+
+def _date_label(d: str) -> str:
+    """날짜 → '2026-01-05 (월) ☀️ -5°~0°' 형식."""
+    dt = pd.to_datetime(d)
+    day_kr = {0: "월", 1: "화", 2: "수", 3: "목", 4: "금", 5: "토", 6: "일"}
+    dow = day_kr.get(dt.dayofweek, "")
+    w = weather_map.get(d, {})
+    emoji = WEATHER_EMOJI.get(w.get("weather", ""), "")
+    temp = ""
+    if w.get("temp_min") is not None and w.get("temp_max") is not None:
+        temp = f" {w['temp_min']:.0f}°~{w['temp_max']:.0f}°"
+    special = SPECIAL_DAYS.get(d, "")
+    label = f"{d} ({dow}) {emoji}{temp}"
+    if special:
+        label += f" · {special}"
+    return label
 
 # ── 사이드바 필터 + 설정 ──────────────────────────────────────────────────
 
@@ -241,9 +272,14 @@ with tab1:
         # ── 날짜 선택 → 출근/퇴근 상세 분석 ──
         st.markdown("")
         avail_dates = sorted(day_summary["date"].unique())
-        sel_date = st.selectbox("날짜 선택", avail_dates, index=len(avail_dates) - 1, key="day_select")
+        date_options = {d: _date_label(d) for d in avail_dates}
+        sel_date = st.selectbox(
+            "날짜 선택", avail_dates, index=len(avail_dates) - 1,
+            format_func=lambda d: date_options.get(d, d), key="day_select",
+        )
 
         if sel_date:
+
             # 전체 하루 개요
             st.plotly_chart(
                 create_intraday_fine_with_range(fine_f, sel_date, 0, 24),
@@ -310,26 +346,25 @@ with tab1:
                             evt = wr["event"]
                             stats = wr["stats"]
                             drain_min = evt.get("drain_minutes", 0)
+                            clear_t = evt.get("gf_clear_time", evt.get("clear_time", ""))
                             cols = st.columns(6)
                             with cols[0]:
                                 render_metric_card(
                                     f"{idx+1}차 퇴근 ({evt['gate_open_time']})",
-                                    f"대기 {evt['peak_dc']:,}명",
+                                    f"{evt['peak_dc']:,}명",
                                     f"모임 {evt['gathering_start_time']} ~")
                             with cols[1]:
                                 render_metric_card("통과 소요", f"{drain_min}분",
-                                                  f"완료 {evt.get('clear_time', '')}")
+                                                  f"완료 {clear_t}")
                             with cols[2]:
-                                gf_avg = evt.get("gf_avg_outflow", 0)
-                                gf_peak = evt.get("gf_peak_outflow", 0)
-                                render_metric_card("유출 속도", f"{gf_avg}명/분",
-                                                  f"피크 {gf_peak}명/분")
+                                render_metric_card("평균 유출",
+                                                  f"{evt.get('gf_avg_outflow', 0)}명/분", "")
                             with cols[3]:
+                                render_metric_card("피크 유출",
+                                                  f"{evt.get('gf_peak_outflow', 0)}명/분", "")
+                            with cols[4]:
                                 render_metric_card("대기 중앙값", f"{stats['median']}분",
                                                   f"{stats['total_people']:,}명")
-                            with cols[4]:
-                                render_metric_card("대기 P90", f"{stats['p90']}분",
-                                                  "90%가 이 이내")
                             with cols[5]:
                                 render_metric_card("최대 대기", f"{stats['max']}분", "")
 
@@ -353,11 +388,13 @@ with tab1:
 
 with tab2:
     avail_dates_all = sorted(fine_f["date"].unique())
+    date_opts_all = {d: _date_label(d) for d in avail_dates_all}
 
     compare_dates = st.multiselect(
         "비교할 날짜 선택 (최대 10일)",
         avail_dates_all,
         default=avail_dates_all[-3:] if len(avail_dates_all) >= 3 else avail_dates_all,
+        format_func=lambda d: date_opts_all.get(d, d),
         max_selections=10, key="compare_dates",
     )
 
@@ -431,42 +468,36 @@ with tab3:
     )
 
     avail_dates_ai = sorted(fine_f["date"].unique())
+    date_opts_ai = {d: _date_label(d) for d in avail_dates_ai}
 
     if ai_mode == "날짜 분석":
         ai_date = st.selectbox("날짜 선택", avail_dates_ai,
+                                format_func=lambda d: date_opts_ai.get(d, d),
                                 index=len(avail_dates_ai) - 1, key="ai_date")
 
         if ai_date:
-            # 해당 날짜 5분 단위 차트
             st.plotly_chart(
                 create_intraday_fine_with_range(fine_f, ai_date, 0, 24),
                 use_container_width=True, key="ai_intraday_chart",
             )
 
-            # 해당 날짜 기본 정보 카드
-            if not commute_times.empty:
-                row = commute_times[commute_times["date"] == ai_date]
-                if not row.empty:
-                    r = row.iloc[0]
-                    c1, c2, c3, c4 = st.columns(4)
-                    with c1:
-                        render_metric_card("출근 시작", str(r.get("entry_start", "-")), "")
-                    with c2:
-                        render_metric_card("출근 피크", str(r.get("entry_peak", "-")),
-                                          f"DC {int(r.get('peak_entry_dc', 0)):,}")
-                    with c3:
-                        render_metric_card("퇴근 피크", str(r.get("exit_peak", "-")),
-                                          f"DC {int(r.get('peak_exit_dc', 0)):,}")
-                    with c4:
-                        render_metric_card("퇴근 종료", str(r.get("exit_end", "-")), "")
-
-            # LLM 분석
             if llm_ready:
                 if st.button("AI 분석 실행", key="run_ai_single", type="primary"):
-                    commute_row = commute_times[commute_times["date"] == ai_date]
-                    commute_info = commute_row.iloc[0].to_dict() if not commute_row.empty else None
                     with st.spinner("Claude가 분석 중..."):
-                        result = analyze_daily_pattern(fine_f, ai_date, commute_info)
+                        # 출근/퇴근 분석 데이터 구성
+                        ai_entry = analyze_entry_flow(fine_f, gf_f, ai_date)
+                        ai_waits = estimate_wait_time_distribution(fine_f, ai_date, gf_f)
+                        # 최근 10일 요약 (비교 맥락)
+                        recent = [d for d in avail_dates_ai if d != ai_date][-10:]
+                        other_summary = _build_period_summary(fine_f, recent, weather_map)
+
+                        result = analyze_daily_pattern(
+                            fine_f, ai_date,
+                            weather_map=weather_map,
+                            entry_info=ai_entry,
+                            wait_results=ai_waits,
+                            other_dates_summary=other_summary,
+                        )
                     if result:
                         st.markdown(f'<div class="ai-box">{result}</div>', unsafe_allow_html=True)
                     else:
@@ -477,6 +508,7 @@ with tab3:
             "비교할 날짜 선택 (2~5일)",
             avail_dates_ai,
             default=avail_dates_ai[-2:] if len(avail_dates_ai) >= 2 else avail_dates_ai,
+            format_func=lambda d: date_opts_ai.get(d, d),
             max_selections=5, key="ai_compare",
         )
 
@@ -489,7 +521,19 @@ with tab3:
             if llm_ready:
                 if st.button("AI 비교 분석 실행", key="run_ai_compare", type="primary"):
                     with st.spinner("Claude가 비교 분석 중..."):
-                        result = compare_dates_pattern(fine_f, ai_compare)
+                        # 각 날짜별 출근/퇴근 데이터 수집
+                        cmp_entries = {}
+                        cmp_waits = {}
+                        for d in ai_compare:
+                            cmp_entries[d] = analyze_entry_flow(fine_f, gf_f, d)
+                            cmp_waits[d] = estimate_wait_time_distribution(fine_f, d, gf_f)
+
+                        result = compare_dates_pattern(
+                            fine_f, ai_compare,
+                            weather_map=weather_map,
+                            all_entry_infos=cmp_entries,
+                            all_wait_results=cmp_waits,
+                        )
                     if result:
                         st.markdown(f'<div class="ai-box">{result}</div>', unsafe_allow_html=True)
                     else:

@@ -4,8 +4,75 @@
 """
 from __future__ import annotations
 
+import json
+import logging
+import ssl
+import urllib.request
+import urllib.parse
+
 import pandas as pd
 import numpy as np
+import streamlit as st
+
+logger = logging.getLogger(__name__)
+
+
+# ── 날씨 (Open-Meteo, 무료, API 키 불필요) ──────────────────────────────────
+
+_Y1_LAT, _Y1_LON = 37.235, 127.209  # Y1 건설현장 (경기도 용인)
+
+
+def _ssl_ctx():
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def fetch_weather(start_date: str, end_date: str) -> pd.DataFrame:
+    """Open-Meteo Archive API로 일별 날씨 조회 (24시간 캐시)."""
+    empty = pd.DataFrame(columns=["date", "precipitation", "snowfall", "temp_max", "temp_min", "weather"])
+    params = {
+        "latitude": _Y1_LAT, "longitude": _Y1_LON,
+        "start_date": start_date, "end_date": end_date,
+        "daily": "precipitation_sum,snowfall_sum,temperature_2m_max,temperature_2m_min",
+        "timezone": "Asia/Seoul",
+    }
+    for base_url in [
+        "https://archive-api.open-meteo.com/v1/archive",
+        "https://api.open-meteo.com/v1/forecast",
+    ]:
+        try:
+            url = f"{base_url}?{urllib.parse.urlencode(params)}"
+            with urllib.request.urlopen(url, timeout=10, context=_ssl_ctx()) as resp:
+                data = json.loads(resp.read().decode())
+            daily = data.get("daily", {})
+            dates = daily.get("time", [])
+            if dates:
+                df = pd.DataFrame({
+                    "date": dates,
+                    "precipitation": daily.get("precipitation_sum"),
+                    "snowfall": daily.get("snowfall_sum"),
+                    "temp_max": daily.get("temperature_2m_max"),
+                    "temp_min": daily.get("temperature_2m_min"),
+                })
+                df["weather"] = df.apply(
+                    lambda r: "Snow" if (not pd.isna(r["snowfall"]) and r["snowfall"] > 0)
+                    else ("Rain" if (not pd.isna(r["precipitation"]) and r["precipitation"] > 0) else "Sunny"),
+                    axis=1,
+                )
+                return df[(df["date"] >= start_date) & (df["date"] <= end_date)].reset_index(drop=True)
+        except Exception:
+            continue
+    return empty
+
+
+WEATHER_EMOJI = {"Sunny": "☀️", "Rain": "🌧️", "Snow": "❄️", "Unknown": "❓"}
 
 # 건설현장 시간대 구분
 TIME_PERIODS = [
@@ -599,14 +666,40 @@ def detect_gate_openings(
         avg_drain_per_min = round(total_outflow / drain_minutes, 1) if drain_minutes > 0 else 0
         peak_drain_per_min = round(peak_outflow_per_min, 1)
 
-        # gate_flow 기반 실제 유출 속도 (좁은 RSSI, MAC 추적)
+        # gate_flow 기반 실제 유출 속도 + 완료 판정 (좁은 RSSI, MAC 추적)
         gf_avg_outflow = 0.0
         gf_peak_outflow = 0.0
-        if gf_day is not None:
-            gf_drain = gf_day[(gf_day.index >= gate_bin) & (gf_day.index <= clear_bin)]
-            if not gf_drain.empty:
-                gf_avg_outflow = round(float(gf_drain["outflow_per_min"].mean()), 1)
-                gf_peak_outflow = round(float(gf_drain["outflow_per_min"].max()), 1)
+        gf_clear_time = ""
+        gf_drain_minutes = drain_minutes  # 기본값은 넓은 RSSI 기준
+
+        if gf_day is not None and not gf_day.empty:
+            # gate_flow 배경 (15~16시)
+            gf_bg = gf_day[(gf_day.index >= 15 * 60) & (gf_day.index < 16 * 60)]
+            gf_baseline = float(gf_bg["total_macs"].median()) if not gf_bg.empty else 5
+            gf_clear_threshold = max(gf_baseline * 2, 10)  # 배경의 2배 이하 = 완료
+
+            # 오픈 이후 데이터
+            gf_after_open = gf_day[gf_day.index >= gate_bin]
+            if not gf_after_open.empty:
+                # 완료 시점: 오픈 후 gate_flow가 배경 수준으로 복귀
+                gf_clear_bin = gate_bin
+                for tb in sorted(gf_after_open.index):
+                    if tb <= gate_bin:
+                        continue
+                    if gf_after_open.loc[tb, "total_macs"] <= gf_clear_threshold:
+                        gf_clear_bin = tb
+                        break
+                else:
+                    gf_clear_bin = int(gf_after_open.index.max())
+
+                gf_clear_time = _bin_to_time(gf_clear_bin)
+                gf_drain_minutes = max(5, (gf_clear_bin - gate_bin) // 5 * 5)
+
+                # 오픈 → 완료 구간의 처리량
+                gf_drain = gf_day[(gf_day.index >= gate_bin) & (gf_day.index <= gf_clear_bin)]
+                if not gf_drain.empty:
+                    gf_avg_outflow = round(float(gf_drain["flow_per_min"].mean()), 1)
+                    gf_peak_outflow = round(float(gf_drain["flow_per_min"].max()), 1)
 
         events.append({
             "gate_open_bin": gate_bin,
@@ -618,9 +711,8 @@ def detect_gate_openings(
             "gathering_start_time": _bin_to_time(int(gathering_start)),
             "clear_bin": int(clear_bin),
             "clear_time": _bin_to_time(int(clear_bin)),
-            "drain_minutes": drain_minutes,
-            "avg_drain_per_min": avg_drain_per_min,
-            "peak_drain_per_min": peak_drain_per_min,
+            "drain_minutes": gf_drain_minutes,
+            "gf_clear_time": gf_clear_time or _bin_to_time(int(clear_bin)),
             "gf_avg_outflow": gf_avg_outflow,
             "gf_peak_outflow": gf_peak_outflow,
         })
